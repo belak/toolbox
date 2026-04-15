@@ -4,4 +4,6 @@ Reusable Go packages for building web applications.
 
 ## Packages
 
-*Coming soon.*
+| Package | Description |
+|---------|-------------|
+| `slogx` | Structured logging helpers wrapping `log/slog` |
