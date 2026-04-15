@@ -1,0 +1,42 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # Bugs
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+
+    # Security
+    - gosec
+
+    # Style
+    - misspell
+
+    # Unused code
+    - unused
+
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+
+    gosec:
+      excludes:
+        - G104 # Handled by errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
