@@ -8,3 +8,4 @@ Reusable Go packages for building web applications.
 - **versionx**: Version extraction from Go build info
 - **httpx**: HTTP router, middleware, flash messages, and JSON helpers
 - **migrate**: SQL migration runner with pluggable drivers
+- **auth**: Authentication primitives: passwords, sessions, OIDC, API tokens, rate limiting
