@@ -1,5 +1,8 @@
 # toolbox
 
+[![CI](https://img.shields.io/github/actions/workflow/status/belak/toolbox/ci.yml?branch=main)](https://github.com/belak/toolbox/actions/workflows/ci.yml)
+[![Go Reference](https://img.shields.io/badge/go-reference-blue)](https://pkg.go.dev/github.com/belak/toolbox)
+
 Reusable Go packages for building web applications.
 
 ## Packages
