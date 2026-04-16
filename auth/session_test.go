@@ -39,8 +39,27 @@ func (m *memSessionStore) UpdateSessionAccess(_ context.Context, token string, a
 	return nil
 }
 
+func (m *memSessionStore) ListSessionsByUser(_ context.Context, userID int64) ([]*SessionRecord, error) {
+	var out []*SessionRecord
+	for _, s := range m.sessions {
+		if s.UserID == userID {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
 func (m *memSessionStore) DeleteSession(_ context.Context, token string) error {
 	delete(m.sessions, token)
+	return nil
+}
+
+func (m *memSessionStore) DeleteSessionsByUser(_ context.Context, userID int64) error {
+	for k, s := range m.sessions {
+		if s.UserID == userID {
+			delete(m.sessions, k)
+		}
+	}
 	return nil
 }
 
@@ -116,6 +135,59 @@ func TestSessionDelete(t *testing.T) {
 
 	got, _ := mgr.Get(ctx, s.ID)
 	assert.Equal(t, (*Session[struct{}])(nil), got)
+}
+
+func TestSessionListByUser(t *testing.T) {
+	store := newMemSessionStore()
+	mgr := NewSessionManager[struct{}](store)
+
+	ctx := context.Background()
+	s1, _ := mgr.Create(ctx, 1, "password", struct{}{})
+	s2, _ := mgr.Create(ctx, 1, "oidc", struct{}{})
+	_, _ = mgr.Create(ctx, 2, "password", struct{}{})
+
+	got, err := mgr.ListByUser(ctx, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, len(got))
+
+	ids := map[string]bool{got[0].ID: true, got[1].ID: true}
+	assert.True(t, ids[s1.ID])
+	assert.True(t, ids[s2.ID])
+}
+
+func TestSessionListByUserSkipsExpired(t *testing.T) {
+	store := newMemSessionStore()
+	mgr := NewSessionManager[struct{}](store)
+	expiredMgr := NewSessionManager[struct{}](store, WithSessionLifetime(0))
+
+	ctx := context.Background()
+	live, _ := mgr.Create(ctx, 1, "password", struct{}{})
+	_, _ = expiredMgr.Create(ctx, 1, "password", struct{}{})
+
+	got, err := mgr.ListByUser(ctx, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(got))
+	assert.Equal(t, live.ID, got[0].ID)
+}
+
+func TestSessionDeleteAllByUser(t *testing.T) {
+	store := newMemSessionStore()
+	mgr := NewSessionManager[struct{}](store)
+
+	ctx := context.Background()
+	_, _ = mgr.Create(ctx, 1, "password", struct{}{})
+	_, _ = mgr.Create(ctx, 1, "oidc", struct{}{})
+	other, _ := mgr.Create(ctx, 2, "password", struct{}{})
+
+	assert.NoError(t, mgr.DeleteAllByUser(ctx, 1))
+
+	got, _ := mgr.ListByUser(ctx, 1)
+	assert.Equal(t, 0, len(got))
+
+	// Other user's session untouched.
+	s, err := mgr.Get(ctx, other.ID)
+	assert.NoError(t, err)
+	assert.NotEqual(t, nil, s)
 }
 
 func TestSessionCookie(t *testing.T) {

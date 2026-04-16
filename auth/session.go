@@ -51,8 +51,10 @@ type Session[T any] struct {
 type SessionStore interface {
 	CreateSession(ctx context.Context, s *SessionRecord) error
 	GetSession(ctx context.Context, token string) (*SessionRecord, error)
+	ListSessionsByUser(ctx context.Context, userID int64) ([]*SessionRecord, error)
 	UpdateSessionAccess(ctx context.Context, token string, at time.Time) error
 	DeleteSession(ctx context.Context, token string) error
+	DeleteSessionsByUser(ctx context.Context, userID int64) error
 	DeleteExpiredSessions(ctx context.Context) error
 }
 
@@ -167,6 +169,33 @@ func (m *SessionManager[T]) Get(ctx context.Context, token string) (*Session[T],
 // Delete removes a session.
 func (m *SessionManager[T]) Delete(ctx context.Context, token string) error {
 	return m.store.DeleteSession(ctx, token)
+}
+
+// ListByUser returns all non-expired sessions for a user. Useful for
+// rendering an "active sessions" view in account settings.
+func (m *SessionManager[T]) ListByUser(ctx context.Context, userID int64) ([]*Session[T], error) {
+	recs, err := m.store.ListSessionsByUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Session[T], 0, len(recs))
+	for _, r := range recs {
+		if r.IsExpired() {
+			continue
+		}
+		s, err := recordToSession[T](r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// DeleteAllByUser removes every session for a user. Use for
+// "sign out everywhere".
+func (m *SessionManager[T]) DeleteAllByUser(ctx context.Context, userID int64) error {
+	return m.store.DeleteSessionsByUser(ctx, userID)
 }
 
 // Cleanup removes all expired sessions.
