@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -17,93 +18,124 @@ const (
 	DefaultSessionLifetime = 7 * 24 * time.Hour
 )
 
-// Session represents an authenticated session.
-type Session struct {
+// SessionRecord is the storage representation of a session. Store
+// implementations work with this type; the generic [Session] is used by
+// application code.
+type SessionRecord struct {
 	ID             string
 	UserID         int64
-	AuthMethod     string // e.g. "password", "oidc"
+	AuthMethod     string
+	Data           json.RawMessage
 	CreatedAt      time.Time
 	ExpiresAt      time.Time
 	LastAccessedAt time.Time
 }
 
 // IsExpired reports whether the session has passed its expiration time.
-func (s *Session) IsExpired() bool {
+func (s *SessionRecord) IsExpired() bool {
 	return time.Now().After(s.ExpiresAt)
+}
+
+// Session represents an authenticated session with typed application data.
+type Session[T any] struct {
+	ID             string
+	UserID         int64
+	AuthMethod     string
+	Data           T
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
+	LastAccessedAt time.Time
 }
 
 // SessionStore is the persistence interface for sessions.
 type SessionStore interface {
-	CreateSession(ctx context.Context, s *Session) error
-	GetSession(ctx context.Context, token string) (*Session, error)
+	CreateSession(ctx context.Context, s *SessionRecord) error
+	GetSession(ctx context.Context, token string) (*SessionRecord, error)
 	UpdateSessionAccess(ctx context.Context, token string, at time.Time) error
 	DeleteSession(ctx context.Context, token string) error
 	DeleteExpiredSessions(ctx context.Context) error
 }
 
-// SessionManager handles session lifecycle.
-type SessionManager struct {
-	store      SessionStore
+type sessionConfig struct {
 	cookieName string
 	lifetime   time.Duration
-	secure     bool // force Secure flag on cookies
+	secure     bool
 }
 
-// SessionOption configures a SessionManager.
-type SessionOption func(*SessionManager)
+// SessionOption configures a [SessionManager].
+type SessionOption func(*sessionConfig)
 
 // WithCookieName sets the session cookie name (default: "session").
 func WithCookieName(name string) SessionOption {
-	return func(m *SessionManager) { m.cookieName = name }
+	return func(c *sessionConfig) { c.cookieName = name }
 }
 
 // WithSessionLifetime sets the session duration (default: 7 days).
 func WithSessionLifetime(d time.Duration) SessionOption {
-	return func(m *SessionManager) { m.lifetime = d }
+	return func(c *sessionConfig) { c.lifetime = d }
 }
 
 // WithSecureCookie forces the Secure flag on session cookies.
 func WithSecureCookie(secure bool) SessionOption {
-	return func(m *SessionManager) { m.secure = secure }
+	return func(c *sessionConfig) { c.secure = secure }
+}
+
+// SessionManager handles session lifecycle with typed session data.
+type SessionManager[T any] struct {
+	store      SessionStore
+	cookieName string
+	lifetime   time.Duration
+	secure     bool
 }
 
 // NewSessionManager creates a SessionManager with the given store and options.
-func NewSessionManager(store SessionStore, opts ...SessionOption) *SessionManager {
-	m := &SessionManager{
-		store:      store,
+func NewSessionManager[T any](store SessionStore, opts ...SessionOption) *SessionManager[T] {
+	cfg := &sessionConfig{
 		cookieName: "session",
 		lifetime:   DefaultSessionLifetime,
 	}
 	for _, o := range opts {
-		o(m)
+		o(cfg)
 	}
-	return m
+	return &SessionManager[T]{
+		store:      store,
+		cookieName: cfg.cookieName,
+		lifetime:   cfg.lifetime,
+		secure:     cfg.secure,
+	}
 }
 
 // CookieName returns the configured cookie name.
-func (m *SessionManager) CookieName() string {
+func (m *SessionManager[T]) CookieName() string {
 	return m.cookieName
 }
 
-// Create generates a new session for the given user, persists it, and returns
-// the session. The caller is responsible for setting the cookie via SetCookie.
-func (m *SessionManager) Create(ctx context.Context, userID int64, authMethod string) (*Session, error) {
+// Create generates a new session for the given user, persists it, and
+// returns the session. The caller is responsible for setting the cookie
+// via SetCookie.
+func (m *SessionManager[T]) Create(ctx context.Context, userID int64, authMethod string, data T) (*Session[T], error) {
 	token, err := generateSessionToken()
 	if err != nil {
 		return nil, err
 	}
 
 	now := time.Now()
-	s := &Session{
+	s := &Session[T]{
 		ID:             token,
 		UserID:         userID,
 		AuthMethod:     authMethod,
+		Data:           data,
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(m.lifetime),
 		LastAccessedAt: now,
 	}
 
-	if err := m.store.CreateSession(ctx, s); err != nil {
+	rec, err := sessionToRecord(s)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := m.store.CreateSession(ctx, rec); err != nil {
 		return nil, fmt.Errorf("creating session: %w", err)
 	}
 
@@ -112,13 +144,18 @@ func (m *SessionManager) Create(ctx context.Context, userID int64, authMethod st
 
 // Get retrieves and validates a session by token. It updates last-accessed
 // time on success. Returns nil if the session is missing or expired.
-func (m *SessionManager) Get(ctx context.Context, token string) (*Session, error) {
-	s, err := m.store.GetSession(ctx, token)
+func (m *SessionManager[T]) Get(ctx context.Context, token string) (*Session[T], error) {
+	rec, err := m.store.GetSession(ctx, token)
 	if err != nil {
 		return nil, err
 	}
-	if s.IsExpired() {
+	if rec.IsExpired() {
 		return nil, nil
+	}
+
+	s, err := recordToSession[T](rec)
+	if err != nil {
+		return nil, err
 	}
 
 	// Best-effort access time update.
@@ -128,17 +165,17 @@ func (m *SessionManager) Get(ctx context.Context, token string) (*Session, error
 }
 
 // Delete removes a session.
-func (m *SessionManager) Delete(ctx context.Context, token string) error {
+func (m *SessionManager[T]) Delete(ctx context.Context, token string) error {
 	return m.store.DeleteSession(ctx, token)
 }
 
 // Cleanup removes all expired sessions.
-func (m *SessionManager) Cleanup(ctx context.Context) error {
+func (m *SessionManager[T]) Cleanup(ctx context.Context) error {
 	return m.store.DeleteExpiredSessions(ctx)
 }
 
 // SetCookie writes the session cookie to the response.
-func (m *SessionManager) SetCookie(w http.ResponseWriter, s *Session) {
+func (m *SessionManager[T]) SetCookie(w http.ResponseWriter, s *Session[T]) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     m.cookieName,
 		Value:    s.ID,
@@ -151,7 +188,7 @@ func (m *SessionManager) SetCookie(w http.ResponseWriter, s *Session) {
 }
 
 // ClearCookie removes the session cookie from the response.
-func (m *SessionManager) ClearCookie(w http.ResponseWriter) {
+func (m *SessionManager[T]) ClearCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:   m.cookieName,
 		Value:  "",
@@ -162,12 +199,45 @@ func (m *SessionManager) ClearCookie(w http.ResponseWriter) {
 
 // GetFromRequest reads the session token from the request cookie and
 // validates it. Returns nil with no error if no cookie is present.
-func (m *SessionManager) GetFromRequest(ctx context.Context, r *http.Request) (*Session, error) {
+func (m *SessionManager[T]) GetFromRequest(ctx context.Context, r *http.Request) (*Session[T], error) {
 	cookie, err := r.Cookie(m.cookieName)
 	if err != nil {
 		return nil, nil
 	}
 	return m.Get(ctx, cookie.Value)
+}
+
+func recordToSession[T any](r *SessionRecord) (*Session[T], error) {
+	s := &Session[T]{
+		ID:             r.ID,
+		UserID:         r.UserID,
+		AuthMethod:     r.AuthMethod,
+		CreatedAt:      r.CreatedAt,
+		ExpiresAt:      r.ExpiresAt,
+		LastAccessedAt: r.LastAccessedAt,
+	}
+	if len(r.Data) > 0 {
+		if err := json.Unmarshal(r.Data, &s.Data); err != nil {
+			return nil, fmt.Errorf("unmarshaling session data: %w", err)
+		}
+	}
+	return s, nil
+}
+
+func sessionToRecord[T any](s *Session[T]) (*SessionRecord, error) {
+	data, err := json.Marshal(s.Data)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling session data: %w", err)
+	}
+	return &SessionRecord{
+		ID:             s.ID,
+		UserID:         s.UserID,
+		AuthMethod:     s.AuthMethod,
+		Data:           data,
+		CreatedAt:      s.CreatedAt,
+		ExpiresAt:      s.ExpiresAt,
+		LastAccessedAt: s.LastAccessedAt,
+	}, nil
 }
 
 func generateSessionToken() (string, error) {
