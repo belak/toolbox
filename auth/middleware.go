@@ -6,124 +6,138 @@ import (
 	"strings"
 )
 
-type contextKey string
+// Resolver loads an authenticated identity from a request. It returns the
+// request context (possibly with values attached) plus an ok flag.
+//
+// Return ok=false with nil error to mean "no authentication present" (the
+// request proceeds unauthenticated). Return a non-nil error to mean "lookup
+// failed" (the middleware invokes its error handler).
+type Resolver func(r *http.Request) (ctx context.Context, ok bool, err error)
 
-const (
-	userContextKey    contextKey = "auth_user_id"
-	sessionContextKey contextKey = "auth_session"
-)
+// AuthMiddleware wraps a [Resolver] with HTTP plumbing for rejecting or
+// tagging unauthenticated requests.
+type AuthMiddleware struct {
+	// Resolve is called once per request to load the identity.
+	Resolve Resolver
 
-// Middleware authenticates requests via session cookie or Bearer token.
-// On success it stores the user ID in the context, accessible via
-// UserIDFromContext. When session auth is used, the full session is also
-// available via SessionFromContext.
-type Middleware[T any] struct {
-	sessions *SessionManager[T]
-	tokens   *APITokenManager
-	onUnauth http.HandlerFunc
+	// OnUnauth is invoked by Require when Resolve reports no
+	// authentication. Defaults to 401 Unauthorized.
+	OnUnauth http.HandlerFunc
+
+	// OnError is invoked when Resolve returns an error. Defaults to 500
+	// Internal Server Error.
+	OnError func(http.ResponseWriter, *http.Request, error)
 }
 
-// MiddlewareOption configures the auth [Middleware].
-type MiddlewareOption[T any] func(*Middleware[T])
-
-// WithAPITokens enables Bearer token authentication.
-func WithAPITokens[T any](m *APITokenManager) MiddlewareOption[T] {
-	return func(mw *Middleware[T]) { mw.tokens = m }
-}
-
-// WithUnauthorizedHandler sets the handler called when authentication fails.
-// Default redirects to /login.
-func WithUnauthorizedHandler[T any](h http.HandlerFunc) MiddlewareOption[T] {
-	return func(mw *Middleware[T]) { mw.onUnauth = h }
-}
-
-// NewMiddleware creates auth middleware that checks sessions and optionally
-// API tokens.
-func NewMiddleware[T any](sessions *SessionManager[T], opts ...MiddlewareOption[T]) *Middleware[T] {
-	mw := &Middleware[T]{
-		sessions: sessions,
-		onUnauth: func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-		},
-	}
-	for _, o := range opts {
-		o(mw)
-	}
-	return mw
-}
-
-// Require returns middleware that rejects unauthenticated requests.
-func (mw *Middleware[T]) Require(next http.Handler) http.Handler {
+// Require returns middleware that rejects unauthenticated requests by
+// invoking OnUnauth.
+func (m *AuthMiddleware) Require(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		session, userID, ok := mw.authenticate(r)
-		if !ok {
-			mw.sessions.ClearCookie(w)
-			mw.onUnauth(w, r)
+		ctx, ok, err := m.Resolve(r)
+		if err != nil {
+			m.onError(w, r, err)
 			return
 		}
-
-		ctx := context.WithValue(r.Context(), userContextKey, userID)
-		if session != nil {
-			ctx = context.WithValue(ctx, sessionContextKey, session)
+		if !ok {
+			m.onUnauth(w, r)
+			return
 		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// Optional returns middleware that populates the user context if
-// authenticated but does not reject unauthenticated requests.
-func (mw *Middleware[T]) Optional(next http.Handler) http.Handler {
+// Optional returns middleware that attaches the resolved identity when
+// present but allows unauthenticated requests through.
+func (m *AuthMiddleware) Optional(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if session, userID, ok := mw.authenticate(r); ok {
-			ctx := context.WithValue(r.Context(), userContextKey, userID)
-			if session != nil {
-				ctx = context.WithValue(ctx, sessionContextKey, session)
-			}
+		ctx, ok, err := m.Resolve(r)
+		if err != nil {
+			m.onError(w, r, err)
+			return
+		}
+		if ok {
 			r = r.WithContext(ctx)
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// authenticate tries session cookie first, then Bearer token.
-func (mw *Middleware[T]) authenticate(r *http.Request) (*Session[T], int64, bool) {
-	// Try session cookie.
-	session, err := mw.sessions.GetFromRequest(r.Context(), r)
-	if err == nil && session != nil {
-		return session, session.UserID, true
+func (m *AuthMiddleware) onUnauth(w http.ResponseWriter, r *http.Request) {
+	if m.OnUnauth != nil {
+		m.OnUnauth(w, r)
+		return
 	}
+	http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+}
 
-	// Try Bearer token.
-	if mw.tokens != nil {
-		if raw := bearerToken(r); raw != "" {
-			token, err := mw.tokens.Validate(r.Context(), raw)
-			if err == nil && token != nil {
-				return nil, token.UserID, true
+func (m *AuthMiddleware) onError(w http.ResponseWriter, r *http.Request, err error) {
+	if m.OnError != nil {
+		m.OnError(w, r, err)
+		return
+	}
+	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+}
+
+// SessionResolver builds a [Resolver] that loads a session via cookie and
+// stores it in the request context under key. Callers retrieve it with a
+// typed helper of their own.
+func SessionResolver[T any](sessions *SessionManager[T], key any) Resolver {
+	return func(r *http.Request) (context.Context, bool, error) {
+		s, err := sessions.GetFromRequest(r.Context(), r)
+		if err != nil {
+			return nil, false, err
+		}
+		if s == nil {
+			return r.Context(), false, nil
+		}
+		return context.WithValue(r.Context(), key, s), true, nil
+	}
+}
+
+// BearerTokenResolver builds a [Resolver] that validates an API token from
+// the Authorization header and stores it in the request context under key.
+func BearerTokenResolver(tokens *APITokenManager, key any) Resolver {
+	return func(r *http.Request) (context.Context, bool, error) {
+		raw := BearerToken(r)
+		if raw == "" {
+			return r.Context(), false, nil
+		}
+		t, err := tokens.Validate(r.Context(), raw)
+		if err != nil {
+			return nil, false, err
+		}
+		if t == nil {
+			return r.Context(), false, nil
+		}
+		return context.WithValue(r.Context(), key, t), true, nil
+	}
+}
+
+// ChainResolvers returns a [Resolver] that tries each resolver in order and
+// returns the first successful result. If every resolver reports
+// unauthenticated, the chain reports unauthenticated. The first error short-
+// circuits the chain.
+func ChainResolvers(rs ...Resolver) Resolver {
+	return func(r *http.Request) (context.Context, bool, error) {
+		for _, fn := range rs {
+			ctx, ok, err := fn(r)
+			if err != nil {
+				return nil, false, err
+			}
+			if ok {
+				return ctx, true, nil
 			}
 		}
+		return r.Context(), false, nil
 	}
-
-	return nil, 0, false
 }
 
-// UserIDFromContext returns the authenticated user ID, or 0 if not
-// authenticated.
-func UserIDFromContext(ctx context.Context) int64 {
-	id, _ := ctx.Value(userContextKey).(int64)
-	return id
-}
-
-// SessionFromContext returns the authenticated session, or nil if the
-// request was not authenticated via a session (e.g. Bearer token auth).
-func SessionFromContext[T any](ctx context.Context) *Session[T] {
-	s, _ := ctx.Value(sessionContextKey).(*Session[T])
-	return s
-}
-
-func bearerToken(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {
-		return auth[7:]
+// BearerToken extracts the token from an "Authorization: Bearer ..." header.
+// Returns an empty string if absent or malformed.
+func BearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
+		return h[7:]
 	}
 	return ""
 }

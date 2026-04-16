@@ -48,6 +48,13 @@ type Session[T any] struct {
 }
 
 // SessionStore is the persistence interface for sessions.
+//
+// GetSession must return (nil, nil) when the token is not found. Non-nil
+// errors are reserved for infrastructure failures (e.g. database
+// unavailable) and will surface as 500s through [AuthMiddleware].
+//
+// UpdateSessionAccess, DeleteSession, and DeleteSessionsByUser are
+// idempotent: a missing token or user is not an error.
 type SessionStore interface {
 	CreateSession(ctx context.Context, s *SessionRecord) error
 	GetSession(ctx context.Context, token string) (*SessionRecord, error)
@@ -145,13 +152,14 @@ func (m *SessionManager[T]) Create(ctx context.Context, userID int64, authMethod
 }
 
 // Get retrieves and validates a session by token. It updates last-accessed
-// time on success. Returns nil if the session is missing or expired.
+// time on success. Returns (nil, nil) if the session is missing or expired;
+// non-nil errors indicate store failures.
 func (m *SessionManager[T]) Get(ctx context.Context, token string) (*Session[T], error) {
 	rec, err := m.store.GetSession(ctx, token)
 	if err != nil {
 		return nil, err
 	}
-	if rec.IsExpired() {
+	if rec == nil || rec.IsExpired() {
 		return nil, nil
 	}
 

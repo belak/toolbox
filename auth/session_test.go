@@ -25,11 +25,7 @@ func (m *memSessionStore) CreateSession(_ context.Context, s *SessionRecord) err
 }
 
 func (m *memSessionStore) GetSession(_ context.Context, token string) (*SessionRecord, error) {
-	s, ok := m.sessions[token]
-	if !ok {
-		return nil, context.Canceled // stand-in for "not found"
-	}
-	return s, nil
+	return m.sessions[token], nil
 }
 
 func (m *memSessionStore) UpdateSessionAccess(_ context.Context, token string, at time.Time) error {
@@ -109,6 +105,15 @@ func TestSessionDataRoundTrip(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotEqual(t, nil, got)
 	assert.Equal(t, data, got.Data)
+}
+
+func TestSessionGetMissing(t *testing.T) {
+	store := newMemSessionStore()
+	mgr := NewSessionManager[struct{}](store)
+
+	got, err := mgr.Get(context.Background(), "nonexistent")
+	assert.NoError(t, err)
+	assert.Equal(t, (*Session[struct{}])(nil), got)
 }
 
 func TestSessionExpired(t *testing.T) {

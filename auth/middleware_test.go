@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,18 +10,26 @@ import (
 	"github.com/alecthomas/assert/v2"
 )
 
-func TestMiddlewareRequireWithSession(t *testing.T) {
+type ctxKey struct{ name string }
+
+var (
+	sessionKey = ctxKey{"session"}
+	tokenKey   = ctxKey{"token"}
+)
+
+func TestRequireAllowsAuthenticated(t *testing.T) {
 	store := newMemSessionStore()
 	mgr := NewSessionManager[struct{}](store, WithCookieName("sid"))
 
 	ctx := context.Background()
 	s, _ := mgr.Create(ctx, 42, "password", struct{}{})
 
-	mw := NewMiddleware(mgr)
+	mw := &AuthMiddleware{Resolve: SessionResolver(mgr, sessionKey)}
 
 	var gotUserID int64
 	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUserID = UserIDFromContext(r.Context())
+		sess, _ := r.Context().Value(sessionKey).(*Session[struct{}])
+		gotUserID = sess.UserID
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -33,11 +42,32 @@ func TestMiddlewareRequireWithSession(t *testing.T) {
 	assert.Equal(t, int64(42), gotUserID)
 }
 
-func TestMiddlewareRequireNoAuth(t *testing.T) {
+func TestRequireRejectsUnauthenticated(t *testing.T) {
 	store := newMemSessionStore()
 	mgr := NewSessionManager[struct{}](store)
 
-	mw := NewMiddleware(mgr)
+	mw := &AuthMiddleware{Resolve: SessionResolver(mgr, sessionKey)}
+	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestRequireCustomOnUnauth(t *testing.T) {
+	store := newMemSessionStore()
+	mgr := NewSessionManager[struct{}](store)
+
+	mw := &AuthMiddleware{
+		Resolve: SessionResolver(mgr, sessionKey),
+		OnUnauth: func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+		},
+	}
 	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
@@ -49,42 +79,57 @@ func TestMiddlewareRequireNoAuth(t *testing.T) {
 	assert.Equal(t, http.StatusSeeOther, w.Code)
 }
 
-func TestMiddlewareRequireWithBearerToken(t *testing.T) {
-	sessionStore := newMemSessionStore()
-	sessions := NewSessionManager[struct{}](sessionStore)
-
-	tokenStore := newMemTokenStore()
-	tokens := NewAPITokenManager(tokenStore)
-
-	ctx := context.Background()
-	raw, _, _ := tokens.Create(ctx, 99, "ci", nil)
-
-	mw := NewMiddleware(sessions, WithAPITokens[struct{}](tokens))
-
-	var gotUserID int64
+func TestRequireResolverError(t *testing.T) {
+	boom := errors.New("boom")
+	mw := &AuthMiddleware{
+		Resolve: func(r *http.Request) (context.Context, bool, error) {
+			return nil, false, boom
+		},
+	}
 	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUserID = UserIDFromContext(r.Context())
-		w.WriteHeader(http.StatusOK)
+		t.Fatal("should not reach handler")
 	}))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/files", nil)
-	req.Header.Set("Authorization", "Bearer "+raw)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, int64(99), gotUserID)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
-func TestMiddlewareOptionalNoAuth(t *testing.T) {
+func TestRequireCustomOnError(t *testing.T) {
+	boom := errors.New("boom")
+	var gotErr error
+	mw := &AuthMiddleware{
+		Resolve: func(r *http.Request) (context.Context, bool, error) {
+			return nil, false, boom
+		},
+		OnError: func(w http.ResponseWriter, _ *http.Request, err error) {
+			gotErr = err
+			http.Error(w, "bad", http.StatusBadGateway)
+		},
+	}
+	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+	assert.Equal(t, boom, gotErr)
+}
+
+func TestOptionalPassesThroughUnauthenticated(t *testing.T) {
 	store := newMemSessionStore()
 	mgr := NewSessionManager[struct{}](store)
 
-	mw := NewMiddleware(mgr)
+	mw := &AuthMiddleware{Resolve: SessionResolver(mgr, sessionKey)}
 
-	var gotUserID int64
+	var sawSession bool
 	handler := mw.Optional(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUserID = UserIDFromContext(r.Context())
+		_, sawSession = r.Context().Value(sessionKey).(*Session[struct{}])
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -93,21 +138,23 @@ func TestMiddlewareOptionalNoAuth(t *testing.T) {
 
 	handler.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, int64(0), gotUserID)
+	assert.False(t, sawSession)
 }
 
-func TestMiddlewareOptionalWithAuth(t *testing.T) {
+func TestOptionalAttachesWhenAuthenticated(t *testing.T) {
 	store := newMemSessionStore()
 	mgr := NewSessionManager[struct{}](store, WithCookieName("s"))
 
 	ctx := context.Background()
 	s, _ := mgr.Create(ctx, 7, "password", struct{}{})
 
-	mw := NewMiddleware(mgr)
+	mw := &AuthMiddleware{Resolve: SessionResolver(mgr, sessionKey)}
 
 	var gotUserID int64
 	handler := mw.Optional(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUserID = UserIDFromContext(r.Context())
+		if sess, ok := r.Context().Value(sessionKey).(*Session[struct{}]); ok {
+			gotUserID = sess.UserID
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -120,18 +167,50 @@ func TestMiddlewareOptionalWithAuth(t *testing.T) {
 	assert.Equal(t, int64(7), gotUserID)
 }
 
-func TestUserIDFromContextEmpty(t *testing.T) {
-	assert.Equal(t, int64(0), UserIDFromContext(context.Background()))
-}
+func TestChainResolversFirstWins(t *testing.T) {
+	sessionStore := newMemSessionStore()
+	sessions := NewSessionManager[struct{}](sessionStore, WithCookieName("sid"))
 
-func TestMiddlewareCustomUnauthorized(t *testing.T) {
-	store := newMemSessionStore()
-	mgr := NewSessionManager[struct{}](store)
+	tokenStore := newMemTokenStore()
+	tokens := NewAPITokenManager(tokenStore)
 
-	mw := NewMiddleware(mgr, WithUnauthorizedHandler[struct{}](func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "nope", http.StatusUnauthorized)
+	ctx := context.Background()
+	raw, _, _ := tokens.Create(ctx, 99, "ci", nil)
+
+	mw := &AuthMiddleware{
+		Resolve: ChainResolvers(
+			SessionResolver(sessions, sessionKey),
+			BearerTokenResolver(tokens, tokenKey),
+		),
+	}
+
+	var gotToken *APIToken
+	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotToken, _ = r.Context().Value(tokenKey).(*APIToken)
+		w.WriteHeader(http.StatusOK)
 	}))
 
+	req := httptest.NewRequest(http.MethodGet, "/api/files", nil)
+	req.Header.Set("Authorization", "Bearer "+raw)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotEqual(t, nil, gotToken)
+	assert.Equal(t, int64(99), gotToken.UserID)
+}
+
+func TestChainResolversAllUnauthenticated(t *testing.T) {
+	store := newMemSessionStore()
+	sessions := NewSessionManager[struct{}](store)
+	tokens := NewAPITokenManager(newMemTokenStore())
+
+	mw := &AuthMiddleware{
+		Resolve: ChainResolvers(
+			SessionResolver(sessions, sessionKey),
+			BearerTokenResolver(tokens, tokenKey),
+		),
+	}
 	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
@@ -143,57 +222,23 @@ func TestMiddlewareCustomUnauthorized(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-func TestSessionFromContext(t *testing.T) {
-	store := newMemSessionStore()
-	mgr := NewSessionManager[testSessionData](store, WithCookieName("sid"))
-
-	ctx := context.Background()
-	data := testSessionData{Theme: "dark", Locale: "en-US"}
-	s, _ := mgr.Create(ctx, 42, "password", data)
-
-	mw := NewMiddleware(mgr)
-
-	var gotSession *Session[testSessionData]
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotSession = SessionFromContext[testSessionData](r.Context())
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.AddCookie(&http.Cookie{Name: "sid", Value: s.ID})
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.NotEqual(t, nil, gotSession)
-	assert.Equal(t, data, gotSession.Data)
-	assert.Equal(t, int64(42), gotSession.UserID)
-}
-
-func TestSessionFromContextBearerToken(t *testing.T) {
-	sessionStore := newMemSessionStore()
-	sessions := NewSessionManager[testSessionData](sessionStore)
-
-	tokenStore := newMemTokenStore()
-	tokens := NewAPITokenManager(tokenStore)
-
-	ctx := context.Background()
-	raw, _, _ := tokens.Create(ctx, 99, "ci", nil)
-
-	mw := NewMiddleware(sessions, WithAPITokens[testSessionData](tokens))
-
-	var gotSession *Session[testSessionData]
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotSession = SessionFromContext[testSessionData](r.Context())
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/api/data", nil)
-	req.Header.Set("Authorization", "Bearer "+raw)
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
-	// Bearer token auth has no session data.
-	assert.Equal(t, (*Session[testSessionData])(nil), gotSession)
+func TestBearerToken(t *testing.T) {
+	cases := []struct {
+		header string
+		want   string
+	}{
+		{"", ""},
+		{"Bearer abc123", "abc123"},
+		{"bearer abc123", "abc123"},
+		{"BEARER abc123", "abc123"},
+		{"Basic foo", ""},
+		{"Bearer", ""},
+	}
+	for _, tc := range cases {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		if tc.header != "" {
+			r.Header.Set("Authorization", tc.header)
+		}
+		assert.Equal(t, tc.want, BearerToken(r))
+	}
 }
