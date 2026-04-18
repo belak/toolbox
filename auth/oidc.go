@@ -208,7 +208,8 @@ func (s *OIDCService) VerifyState(state string) (string, error) {
 }
 
 // AuthCodeURL returns the authorization URL and a PKCE verifier. The caller
-// must persist the verifier (e.g. in a cookie) and pass it to Exchange.
+// must persist the verifier across the redirect and pass it to Exchange on
+// callback. See [PKCECookie] for the recommended default persistence.
 // Triggers provider discovery if not yet resolved.
 func (s *OIDCService) AuthCodeURL(ctx context.Context, state string) (authURL, verifier string, err error) {
 	r, err := s.resolve(ctx)
