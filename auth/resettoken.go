@@ -33,6 +33,12 @@ func (t *ResetToken) IsExpired() bool {
 }
 
 // ResetTokenStore is the persistence interface for password reset tokens.
+//
+// GetResetTokenByHash must return (nil, nil) when the token is not found.
+// Non-nil errors are reserved for infrastructure failures.
+//
+// DeleteResetToken and DeleteResetTokensByUser are idempotent: a missing
+// token or user is not an error.
 type ResetTokenStore interface {
 	CreateResetToken(ctx context.Context, t *ResetToken) error
 	GetResetTokenByHash(ctx context.Context, hash string) (*ResetToken, error)
@@ -101,6 +107,9 @@ func (m *ResetTokenManager) Validate(ctx context.Context, rawToken string) (*Res
 	token, err := m.store.GetResetTokenByHash(ctx, hash)
 	if err != nil {
 		return nil, err
+	}
+	if token == nil {
+		return nil, nil
 	}
 
 	if token.IsExpired() {

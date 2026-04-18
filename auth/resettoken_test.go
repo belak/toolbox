@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -29,7 +28,7 @@ func (m *memResetTokenStore) CreateResetToken(_ context.Context, t *ResetToken) 
 func (m *memResetTokenStore) GetResetTokenByHash(_ context.Context, hash string) (*ResetToken, error) {
 	t, ok := m.tokens[hash]
 	if !ok {
-		return nil, fmt.Errorf("not found")
+		return nil, nil
 	}
 	return t, nil
 }
@@ -81,15 +80,13 @@ func TestResetTokenExpired(t *testing.T) {
 	assert.Equal(t, (*ResetToken)(nil), got)
 }
 
-func TestResetTokenWrongToken(t *testing.T) {
+func TestResetTokenNotFound(t *testing.T) {
 	store := newMemResetTokenStore()
 	mgr := NewResetTokenManager(store)
 
-	ctx := context.Background()
-	_, _, _ = mgr.Create(ctx, 1)
-
-	_, err := mgr.Validate(ctx, "wrong-token")
-	assert.Error(t, err)
+	got, err := mgr.Validate(context.Background(), "unknown-token")
+	assert.NoError(t, err)
+	assert.Equal(t, (*ResetToken)(nil), got)
 }
 
 func TestResetTokenConsume(t *testing.T) {
@@ -109,10 +106,12 @@ func TestResetTokenConsume(t *testing.T) {
 	assert.Equal(t, int64(42), got.UserID)
 
 	// Both tokens should now be gone.
-	_, err = mgr.Validate(ctx, raw1)
-	assert.Error(t, err)
-	_, err = mgr.Validate(ctx, raw2)
-	assert.Error(t, err)
+	got1, err := mgr.Validate(ctx, raw1)
+	assert.NoError(t, err)
+	assert.Equal(t, (*ResetToken)(nil), got1)
+	got2, err := mgr.Validate(ctx, raw2)
+	assert.NoError(t, err)
+	assert.Equal(t, (*ResetToken)(nil), got2)
 }
 
 func TestResetTokenConsumeExpired(t *testing.T) {

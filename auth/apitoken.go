@@ -39,6 +39,13 @@ func (t *APIToken) IsExpired() bool {
 }
 
 // APITokenStore is the persistence interface for API tokens.
+//
+// GetAPITokenByHash must return (nil, nil) when the token is not found.
+// Non-nil errors are reserved for infrastructure failures and will surface
+// as internal errors through callers.
+//
+// UpdateAPITokenLastUsed and DeleteAPIToken are idempotent: a missing token
+// is not an error.
 type APITokenStore interface {
 	CreateAPIToken(ctx context.Context, t *APIToken) error
 	GetAPITokenByHash(ctx context.Context, hash string) (*APIToken, error)
@@ -109,6 +116,9 @@ func (m *APITokenManager) Validate(ctx context.Context, rawToken string) (*APITo
 	token, err := m.store.GetAPITokenByHash(ctx, hash)
 	if err != nil {
 		return nil, err
+	}
+	if token == nil {
+		return nil, nil
 	}
 
 	if token.IsExpired() {

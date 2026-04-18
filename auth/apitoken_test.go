@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -29,7 +28,7 @@ func (m *memTokenStore) CreateAPIToken(_ context.Context, t *APIToken) error {
 func (m *memTokenStore) GetAPITokenByHash(_ context.Context, hash string) (*APIToken, error) {
 	t, ok := m.tokens[hash]
 	if !ok {
-		return nil, fmt.Errorf("not found")
+		return nil, nil
 	}
 	return t, nil
 }
@@ -79,9 +78,19 @@ func TestAPITokenCreateAndValidate(t *testing.T) {
 	assert.True(t, got != nil)
 	assert.Equal(t, token.ID, got.ID)
 
-	// Validate with wrong token.
-	_, err = mgr.Validate(ctx, "bt_wrong")
-	assert.Error(t, err)
+	// Validate with unknown token returns nil, nil.
+	got2, err := mgr.Validate(ctx, "bt_wrong")
+	assert.NoError(t, err)
+	assert.Equal(t, (*APIToken)(nil), got2)
+}
+
+func TestAPITokenValidateNotFound(t *testing.T) {
+	store := newMemTokenStore()
+	mgr := NewAPITokenManager(store)
+
+	got, err := mgr.Validate(context.Background(), "bt_unknown")
+	assert.NoError(t, err)
+	assert.Equal(t, (*APIToken)(nil), got)
 }
 
 func TestAPITokenPrefix(t *testing.T) {
@@ -117,7 +126,7 @@ func TestAPITokenDelete(t *testing.T) {
 	assert.NoError(t, mgr.Delete(ctx, token.ID))
 
 	got, err := mgr.Validate(ctx, raw)
-	assert.Error(t, err) // not found
+	assert.NoError(t, err)
 	assert.Equal(t, (*APIToken)(nil), got)
 }
 

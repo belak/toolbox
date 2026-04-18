@@ -33,6 +33,14 @@ type OIDCIdentity struct {
 }
 
 // OIDCIdentityStore is the persistence interface for OIDC identities.
+// OIDCIdentityStore is the persistence interface for OIDC identities.
+//
+// GetOIDCIdentity must return (nil, nil) when no identity matches the
+// given issuer and subject. Non-nil errors are reserved for infrastructure
+// failures.
+//
+// UpdateOIDCLastLogin and DeleteOIDCIdentity are idempotent: a missing
+// identity is not an error.
 type OIDCIdentityStore interface {
 	GetOIDCIdentity(ctx context.Context, issuer, subject string) (*OIDCIdentity, error)
 	GetOIDCIdentitiesByUserID(ctx context.Context, userID int64) ([]*OIDCIdentity, error)
