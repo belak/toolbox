@@ -1,10 +1,14 @@
 package httpx
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 )
+
+// DefaultFlashCookieName is used when [Flash.CookieName] is empty.
+const DefaultFlashCookieName = "flash"
 
 // FlashMessage represents a one-time feedback message displayed after a
 // redirect (e.g. "File uploaded successfully").
@@ -13,16 +17,29 @@ type FlashMessage struct {
 	Message string `json:"message"`
 }
 
-// SetFlash stores a flash message in a cookie. The message is consumed on
-// the next request by GetFlash.
-func SetFlash(w http.ResponseWriter, cookieName, flashType, message string) {
-	data, err := json.Marshal(FlashMessage{Type: flashType, Message: message})
+// Flash reads and writes one-shot feedback messages via cookie.
+type Flash struct {
+	// CookieName overrides the cookie name. Empty uses DefaultFlashCookieName.
+	CookieName string
+}
+
+func (f *Flash) cookieName() string {
+	if f.CookieName == "" {
+		return DefaultFlashCookieName
+	}
+	return f.CookieName
+}
+
+// Set stores a flash message. The message is consumed on the next request
+// by Get.
+func (f *Flash) Set(w http.ResponseWriter, kind, message string) {
+	data, err := json.Marshal(FlashMessage{Type: kind, Message: message})
 	if err != nil {
 		return
 	}
 
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
+		Name:     f.cookieName(),
 		Value:    base64.StdEncoding.EncodeToString(data),
 		Path:     "/",
 		MaxAge:   60, // 1 minute, enough for a redirect
@@ -31,17 +48,17 @@ func SetFlash(w http.ResponseWriter, cookieName, flashType, message string) {
 	})
 }
 
-// GetFlash retrieves and clears the flash message cookie. Returns nil if
-// no flash is set.
-func GetFlash(w http.ResponseWriter, r *http.Request, cookieName string) *FlashMessage {
-	cookie, err := r.Cookie(cookieName)
+// Get retrieves and clears the flash cookie. Returns nil if no flash is set.
+func (f *Flash) Get(w http.ResponseWriter, r *http.Request) *FlashMessage {
+	name := f.cookieName()
+	cookie, err := r.Cookie(name)
 	if err != nil {
 		return nil
 	}
 
 	// Clear immediately. Flash messages are single-use.
 	http.SetCookie(w, &http.Cookie{
-		Name:   cookieName,
+		Name:   name,
 		Value:  "",
 		Path:   "/",
 		MaxAge: -1,
@@ -57,4 +74,17 @@ func GetFlash(w http.ResponseWriter, r *http.Request, cookieName string) *FlashM
 		return nil
 	}
 	return &flash
+}
+
+// Middleware loads any flash message into the request context under key,
+// clearing the cookie. Handlers retrieve it via a caller-owned helper.
+func (f *Flash) Middleware(key any) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if msg := f.Get(w, r); msg != nil {
+				r = r.WithContext(context.WithValue(r.Context(), key, msg))
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
