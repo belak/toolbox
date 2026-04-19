@@ -10,16 +10,16 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func openTestDB(t *testing.T) *sql.DB {
+func openTestDB(t *testing.T) (*sql.DB, DB) {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
 	assert.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
-	return db
+	return db, NewDriver(db, SQLiteDialect{})
 }
 
 func TestMigrateAppliesInOrder(t *testing.T) {
-	db := openTestDB(t)
+	raw, db := openTestDB(t)
 
 	fsys := fstest.MapFS{
 		"migrations/0002_second.sql": {Data: []byte("CREATE TABLE b (id INTEGER);")},
@@ -27,7 +27,7 @@ func TestMigrateAppliesInOrder(t *testing.T) {
 		"migrations/0003_third.sql":  {Data: []byte("CREATE TABLE c (id INTEGER);")},
 	}
 
-	m := New(db, SQLiteDriver{}, fsys)
+	m := New(db, fsys)
 	result, err := m.Migrate(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, 3, len(result.Applied))
@@ -40,19 +40,19 @@ func TestMigrateAppliesInOrder(t *testing.T) {
 
 	// Tables should exist.
 	for _, table := range []string{"a", "b", "c"} {
-		_, err := db.Exec("SELECT 1 FROM " + table) //nolint:gosec // test-only, table names are hardcoded
+		_, err := raw.Exec("SELECT 1 FROM " + table) //nolint:gosec // test-only, table names are hardcoded
 		assert.NoError(t, err)
 	}
 }
 
 func TestMigrateIdempotent(t *testing.T) {
-	db := openTestDB(t)
+	_, db := openTestDB(t)
 
 	fsys := fstest.MapFS{
 		"migrations/0001_init.sql": {Data: []byte("CREATE TABLE t (id INTEGER);")},
 	}
 
-	m := New(db, SQLiteDriver{}, fsys)
+	m := New(db, fsys)
 
 	r1, err := m.Migrate(context.Background())
 	assert.NoError(t, err)
@@ -66,14 +66,14 @@ func TestMigrateIdempotent(t *testing.T) {
 }
 
 func TestMigrateIncremental(t *testing.T) {
-	db := openTestDB(t)
+	_, db := openTestDB(t)
 
 	// First run with one migration.
 	fsys1 := fstest.MapFS{
 		"migrations/0001_init.sql": {Data: []byte("CREATE TABLE a (id INTEGER);")},
 	}
 
-	m1 := New(db, SQLiteDriver{}, fsys1)
+	m1 := New(db, fsys1)
 	r1, err := m1.Migrate(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(r1.Applied))
@@ -84,7 +84,7 @@ func TestMigrateIncremental(t *testing.T) {
 		"migrations/0002_add_b.sql": {Data: []byte("CREATE TABLE b (id INTEGER);")},
 	}
 
-	m2 := New(db, SQLiteDriver{}, fsys2)
+	m2 := New(db, fsys2)
 	r2, err := m2.Migrate(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(r2.Applied))
@@ -93,14 +93,14 @@ func TestMigrateIncremental(t *testing.T) {
 }
 
 func TestMigrateRollsBackOnError(t *testing.T) {
-	db := openTestDB(t)
+	raw, db := openTestDB(t)
 
 	fsys := fstest.MapFS{
 		"migrations/0001_good.sql": {Data: []byte("CREATE TABLE good (id INTEGER);")},
 		"migrations/0002_bad.sql":  {Data: []byte("INVALID SQL SYNTAX HERE;")},
 	}
 
-	m := New(db, SQLiteDriver{}, fsys)
+	m := New(db, fsys)
 	result, err := m.Migrate(context.Background())
 	assert.Error(t, err)
 
@@ -108,7 +108,7 @@ func TestMigrateRollsBackOnError(t *testing.T) {
 	assert.Equal(t, 1, len(result.Applied))
 
 	// "good" table should exist.
-	_, err = db.Exec("SELECT 1 FROM good")
+	_, err = raw.Exec("SELECT 1 FROM good")
 	assert.NoError(t, err)
 
 	// Bad migration should not be recorded.
@@ -119,14 +119,14 @@ func TestMigrateRollsBackOnError(t *testing.T) {
 }
 
 func TestPending(t *testing.T) {
-	db := openTestDB(t)
+	_, db := openTestDB(t)
 
 	fsys := fstest.MapFS{
 		"migrations/0001_a.sql": {Data: []byte("CREATE TABLE a (id INTEGER);")},
 		"migrations/0002_b.sql": {Data: []byte("CREATE TABLE b (id INTEGER);")},
 	}
 
-	m := New(db, SQLiteDriver{}, fsys)
+	m := New(db, fsys)
 
 	pending, err := m.Pending(context.Background())
 	assert.NoError(t, err)
@@ -142,13 +142,13 @@ func TestPending(t *testing.T) {
 }
 
 func TestCustomTableAndDirectory(t *testing.T) {
-	db := openTestDB(t)
+	raw, db := openTestDB(t)
 
 	fsys := fstest.MapFS{
 		"db/0001_init.sql": {Data: []byte("CREATE TABLE x (id INTEGER);")},
 	}
 
-	m := New(db, SQLiteDriver{}, fsys,
+	m := New(db, fsys,
 		WithTable("my_migrations"),
 		WithDirectory("db"),
 	)
@@ -159,19 +159,19 @@ func TestCustomTableAndDirectory(t *testing.T) {
 
 	// Custom table should exist.
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM my_migrations").Scan(&count)
+	err = raw.QueryRow("SELECT COUNT(*) FROM my_migrations").Scan(&count)
 	assert.NoError(t, err)
 	assert.Equal(t, 1, count)
 }
 
 func TestEmptyMigrations(t *testing.T) {
-	db := openTestDB(t)
+	_, db := openTestDB(t)
 
 	fsys := fstest.MapFS{
 		"migrations/.gitkeep": {Data: []byte("")},
 	}
 
-	m := New(db, SQLiteDriver{}, fsys)
+	m := New(db, fsys)
 	result, err := m.Migrate(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, 0, len(result.Applied))

@@ -1,47 +1,62 @@
-// Package migrate provides a minimal database migration runner using
-// database/sql. Migrations are read from an fs.FS (typically embed.FS)
-// and applied in lexicographic order. Applied versions are tracked in a
-// configurable table.
+// Package migrate provides a minimal database migration runner.
+// Migrations are read from an fs.FS (typically embed.FS) and applied in
+// lexicographic order. Applied versions are tracked in a configurable
+// table.
 //
-// The package abstracts dialect differences through a small Driver
-// interface so the same migration runner works with SQLite, PostgreSQL,
-// or any other database/sql-compatible database.
+// Database access and dialect differences are abstracted through the DB
+// interface. Use NewDriver to wrap a *sql.DB with a Dialect, or the
+// pgxmigrate sub-package for native pgx support.
 package migrate
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io/fs"
 	"sort"
 	"strings"
 )
 
-// Driver abstracts dialect-specific SQL differences. Implementations for
-// common databases are provided by the sqlite and postgres sub-packages,
-// or callers can implement their own.
-type Driver interface {
-	// CreateTableSQL returns the DDL to create the migrations tracking
-	// table if it does not exist.
+// DB abstracts database operations and dialect-specific SQL. Use
+// NewDriver to create one from a *sql.DB and Dialect, or implement
+// this interface for other database libraries such as pgx.
+type DB interface {
+	Exec(ctx context.Context, query string, args ...any) error
+	Query(ctx context.Context, query string, args ...any) (Rows, error)
+	Begin(ctx context.Context) (Tx, error)
+
 	CreateTableSQL(table string) string
-
-	// InsertVersionSQL returns an INSERT statement for recording a
-	// migration version. It must use a single placeholder for the
-	// version string.
 	InsertVersionSQL(table string) string
+	QueryVersionsSQL(table string) string
+}
 
-	// QueryVersionsSQL returns a SELECT statement that returns all
-	// applied version strings.
+// Rows abstracts result set iteration.
+type Rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+	Close()
+}
+
+// Tx abstracts a database transaction.
+type Tx interface {
+	Exec(ctx context.Context, query string, args ...any) error
+	Rollback(ctx context.Context) error
+	Commit(ctx context.Context) error
+}
+
+// Dialect abstracts dialect-specific SQL differences.
+type Dialect interface {
+	CreateTableSQL(table string) string
+	InsertVersionSQL(table string) string
 	QueryVersionsSQL(table string) string
 }
 
 // Migrator runs migrations against a database.
 type Migrator struct {
-	db     *sql.DB
-	driver Driver
-	fs     fs.FS
-	dir    string // subdirectory within fs to read migrations from
-	table  string
+	db    DB
+	fs    fs.FS
+	dir   string // subdirectory within fs to read migrations from
+	table string
 }
 
 // Option configures a Migrator.
@@ -61,13 +76,12 @@ func WithDirectory(dir string) Option {
 
 // New creates a Migrator. The fs should contain .sql files named with a
 // sortable prefix (e.g. 0001_initial.sql, 0002_add_users.sql).
-func New(db *sql.DB, driver Driver, fsys fs.FS, opts ...Option) *Migrator {
+func New(db DB, fsys fs.FS, opts ...Option) *Migrator {
 	m := &Migrator{
-		db:     db,
-		driver: driver,
-		fs:     fsys,
-		dir:    "migrations",
-		table:  "schema_migrations",
+		db:    db,
+		fs:    fsys,
+		dir:   "migrations",
+		table: "schema_migrations",
 	}
 	for _, o := range opts {
 		o(m)
@@ -86,7 +100,7 @@ type MigrateResult struct {
 // applied versions.
 func (m *Migrator) Migrate(ctx context.Context) (*MigrateResult, error) {
 	// Create tracking table.
-	if _, err := m.db.ExecContext(ctx, m.driver.CreateTableSQL(m.table)); err != nil {
+	if err := m.db.Exec(ctx, m.db.CreateTableSQL(m.table)); err != nil {
 		return nil, fmt.Errorf("creating migrations table: %w", err)
 	}
 
@@ -133,7 +147,7 @@ func (m *Migrator) Migrate(ctx context.Context) (*MigrateResult, error) {
 // applied.
 func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 	// Ensure table exists for the query.
-	if _, err := m.db.ExecContext(ctx, m.driver.CreateTableSQL(m.table)); err != nil {
+	if err := m.db.Exec(ctx, m.db.CreateTableSQL(m.table)); err != nil {
 		return nil, fmt.Errorf("creating migrations table: %w", err)
 	}
 
@@ -158,7 +172,7 @@ func (m *Migrator) Pending(ctx context.Context) ([]string, error) {
 }
 
 func (m *Migrator) loadApplied(ctx context.Context) (map[string]bool, error) {
-	rows, err := m.db.QueryContext(ctx, m.driver.QueryVersionsSQL(m.table))
+	rows, err := m.db.Query(ctx, m.db.QueryVersionsSQL(m.table))
 	if err != nil {
 		return nil, fmt.Errorf("querying applied migrations: %w", err)
 	}
@@ -198,22 +212,22 @@ func (m *Migrator) applyMigration(ctx context.Context, filename, version string)
 		return fmt.Errorf("reading migration %s: %w", filename, err)
 	}
 
-	tx, err := m.db.BeginTx(ctx, nil)
+	tx, err := m.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning transaction for %s: %w", filename, err)
 	}
 
-	if _, err := tx.ExecContext(ctx, string(content)); err != nil {
-		_ = tx.Rollback()
+	if err := tx.Exec(ctx, string(content)); err != nil {
+		_ = tx.Rollback(ctx)
 		return fmt.Errorf("executing migration %s: %w", filename, err)
 	}
 
-	if _, err := tx.ExecContext(ctx, m.driver.InsertVersionSQL(m.table), version); err != nil {
-		_ = tx.Rollback()
+	if err := tx.Exec(ctx, m.db.InsertVersionSQL(m.table), version); err != nil {
+		_ = tx.Rollback(ctx)
 		return fmt.Errorf("recording migration %s: %w", filename, err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing migration %s: %w", filename, err)
 	}
 
