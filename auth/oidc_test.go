@@ -37,8 +37,15 @@ func TestOIDCStateTampered(t *testing.T) {
 	svc := &OIDCService{secret: []byte("secret")}
 
 	state, _ := svc.GenerateState("login")
-	// Flip a character.
-	tampered := state[:len(state)-1] + "X"
+	// Flip a character in the middle. Flipping the last base64 char can be
+	// a no-op because unused trailing bits mean multiple chars decode the
+	// same, which would leave the HMAC intact.
+	mid := len(state) / 2
+	flip := byte('A')
+	if state[mid] == flip {
+		flip = 'B'
+	}
+	tampered := state[:mid] + string(flip) + state[mid+1:]
 
 	_, err := svc.VerifyState(tampered)
 	assert.Error(t, err)
