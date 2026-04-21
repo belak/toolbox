@@ -39,9 +39,9 @@ func (s *sqlDB) Begin(ctx context.Context) (Tx, error) {
 type sqlRows struct{ rows *sql.Rows }
 
 func (r *sqlRows) Next() bool             { return r.rows.Next() }
-func (r *sqlRows) Scan(dest ...any) error  { return r.rows.Scan(dest...) }
-func (r *sqlRows) Err() error              { return r.rows.Err() }
-func (r *sqlRows) Close()                  { r.rows.Close() }
+func (r *sqlRows) Scan(dest ...any) error { return r.rows.Scan(dest...) }
+func (r *sqlRows) Err() error             { return r.rows.Err() }
+func (r *sqlRows) Close()                 { r.rows.Close() }
 
 type sqlTx struct{ tx *sql.Tx }
 
