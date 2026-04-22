@@ -222,6 +222,109 @@ func TestChainResolversAllUnauthenticated(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+func TestBasicAuthTokenResolverValid(t *testing.T) {
+	store := newMemTokenStore()
+	tokens := NewAPITokenManager(store)
+
+	ctx := context.Background()
+	raw, _, _ := tokens.Create(ctx, 42, "webdav", nil)
+
+	lookup := func(_ context.Context, username string) (int64, error) {
+		if username == "alice" {
+			return 42, nil
+		}
+		return 0, errors.New("not found")
+	}
+
+	mw := &AuthMiddleware{Resolve: BasicAuthTokenResolver(tokens, lookup, tokenKey)}
+	var gotToken *APIToken
+	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotToken, _ = r.Context().Value(tokenKey).(*APIToken)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
+	req.SetBasicAuth("alice", raw)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotEqual(t, nil, gotToken)
+	assert.Equal(t, int64(42), gotToken.UserID)
+}
+
+func TestBasicAuthTokenResolverNoHeader(t *testing.T) {
+	tokens := NewAPITokenManager(newMemTokenStore())
+	lookup := func(_ context.Context, _ string) (int64, error) {
+		t.Fatal("lookupUser should not be called")
+		return 0, nil
+	}
+
+	mw := &AuthMiddleware{Resolve: BasicAuthTokenResolver(tokens, lookup, tokenKey)}
+	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestBasicAuthTokenResolverWrongUsername(t *testing.T) {
+	store := newMemTokenStore()
+	tokens := NewAPITokenManager(store)
+
+	ctx := context.Background()
+	// Token belongs to user 42, but we look up "eve" who is user 99.
+	raw, _, _ := tokens.Create(ctx, 42, "webdav", nil)
+
+	lookup := func(_ context.Context, username string) (int64, error) {
+		if username == "eve" {
+			return 99, nil
+		}
+		return 0, errors.New("not found")
+	}
+
+	mw := &AuthMiddleware{Resolve: BasicAuthTokenResolver(tokens, lookup, tokenKey)}
+	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
+	req.SetBasicAuth("eve", raw)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestBasicAuthTokenResolverLookupError(t *testing.T) {
+	store := newMemTokenStore()
+	tokens := NewAPITokenManager(store)
+
+	ctx := context.Background()
+	raw, _, _ := tokens.Create(ctx, 1, "webdav", nil)
+
+	boom := errors.New("db down")
+	lookup := func(_ context.Context, _ string) (int64, error) {
+		return 0, boom
+	}
+
+	mw := &AuthMiddleware{Resolve: BasicAuthTokenResolver(tokens, lookup, tokenKey)}
+	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/", nil)
+	req.SetBasicAuth("alice", raw)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
 func TestBearerToken(t *testing.T) {
 	cases := []struct {
 		header string

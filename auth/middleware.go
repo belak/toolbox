@@ -132,6 +132,35 @@ func ChainResolvers(rs ...Resolver) Resolver {
 	}
 }
 
+// BasicAuthTokenResolver builds a [Resolver] that validates an API token
+// supplied as the password in HTTP Basic Auth credentials. lookupUser must
+// return the user ID for a given username; the resolver confirms the token
+// belongs to that user. A mismatch is treated as unauthenticated (ok=false),
+// not an error.
+func BasicAuthTokenResolver(tokens *APITokenManager, lookupUser func(ctx context.Context, username string) (int64, error), key any) Resolver {
+	return func(r *http.Request) (context.Context, bool, error) {
+		username, raw, ok := r.BasicAuth()
+		if !ok || raw == "" {
+			return r.Context(), false, nil
+		}
+		t, err := tokens.Validate(r.Context(), raw)
+		if err != nil {
+			return nil, false, err
+		}
+		if t == nil {
+			return r.Context(), false, nil
+		}
+		userID, err := lookupUser(r.Context(), username)
+		if err != nil {
+			return nil, false, err
+		}
+		if t.UserID != userID {
+			return r.Context(), false, nil
+		}
+		return context.WithValue(r.Context(), key, t), true, nil
+	}
+}
+
 // BearerToken extracts the token from an "Authorization: Bearer ..." header.
 // Returns an empty string if absent or malformed.
 func BearerToken(r *http.Request) string {

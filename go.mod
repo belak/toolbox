@@ -6,6 +6,7 @@ require (
 	github.com/alecthomas/assert/v2 v2.11.0
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/felixge/httpsnoop v1.0.4
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/lmittmann/tint v1.1.3
 	golang.org/x/crypto v0.50.0
 	golang.org/x/oauth2 v0.36.0
@@ -20,7 +21,6 @@ require (
 	github.com/hexops/gotextdiff v1.0.3 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/pgx/v5 v5.9.2 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
