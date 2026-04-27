@@ -27,10 +27,11 @@ func GetRequestID(ctx context.Context) string {
 	return id
 }
 
-// RequestID adds a unique request ID to each request. If the request
-// already has an X-Request-ID header (e.g. from a load balancer), it is
-// reused.
-func RequestID(next http.Handler) http.Handler {
+// WithRequestID adds a unique request ID to each request. If the
+// request already has an X-Request-ID header (e.g. from a load
+// balancer), it is reused. The ID is also stored on the context and
+// retrievable via GetRequestID.
+func WithRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(requestIDHeader)
 		if id == "" {
@@ -107,4 +108,16 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// CSP returns middleware that sets a Content-Security-Policy header on
+// every response. The policy is application-specific; callers pass it
+// in directly (e.g. "default-src 'self'; script-src 'self'").
+func CSP(policy string) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Security-Policy", policy)
+			next.ServeHTTP(w, r)
+		})
+	}
 }
