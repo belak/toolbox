@@ -14,68 +14,81 @@ import (
 // failed" (the middleware invokes its error handler).
 type Resolver func(r *http.Request) (ctx context.Context, ok bool, err error)
 
-// AuthMiddleware wraps a [Resolver] with HTTP plumbing for rejecting or
-// tagging unauthenticated requests.
-type AuthMiddleware struct {
-	// Resolve is called once per request to load the identity.
-	Resolve Resolver
+// Option configures [Require] and [Optional] middleware.
+type Option func(*config)
 
-	// OnUnauth is invoked by Require when Resolve reports no
-	// authentication. Defaults to 401 Unauthorized.
-	OnUnauth http.HandlerFunc
-
-	// OnError is invoked when Resolve returns an error. Defaults to 500
-	// Internal Server Error.
-	OnError func(http.ResponseWriter, *http.Request, error)
+type config struct {
+	onUnauth http.HandlerFunc
+	onError  func(http.ResponseWriter, *http.Request, error)
 }
 
-// Require returns middleware that rejects unauthenticated requests by
-// invoking OnUnauth.
-func (m *AuthMiddleware) Require(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, ok, err := m.Resolve(r)
-		if err != nil {
-			m.onError(w, r, err)
-			return
-		}
-		if !ok {
-			m.onUnauth(w, r)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+// OnUnauthorized sets the handler invoked when the resolver reports no
+// authentication. Applies only to [Require]; [Optional] passes
+// unauthenticated requests through. Defaults to 401 Unauthorized.
+func OnUnauthorized(h http.HandlerFunc) Option {
+	return func(c *config) { c.onUnauth = h }
 }
 
-// Optional returns middleware that attaches the resolved identity when
-// present but allows unauthenticated requests through.
-func (m *AuthMiddleware) Optional(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, ok, err := m.Resolve(r)
-		if err != nil {
-			m.onError(w, r, err)
-			return
-		}
-		if ok {
-			r = r.WithContext(ctx)
-		}
-		next.ServeHTTP(w, r)
-	})
+// OnError sets the handler invoked when the resolver returns an error.
+// Defaults to 500 Internal Server Error.
+func OnError(h func(http.ResponseWriter, *http.Request, error)) Option {
+	return func(c *config) { c.onError = h }
 }
 
-func (m *AuthMiddleware) onUnauth(w http.ResponseWriter, r *http.Request) {
-	if m.OnUnauth != nil {
-		m.OnUnauth(w, r)
-		return
+func newConfig(opts []Option) *config {
+	c := &config{
+		onUnauth: func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		},
+		onError: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		},
 	}
-	http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
-func (m *AuthMiddleware) onError(w http.ResponseWriter, r *http.Request, err error) {
-	if m.OnError != nil {
-		m.OnError(w, r, err)
-		return
+// Require returns middleware that rejects unauthenticated requests.
+// On error the configured [OnError] handler runs; on missing auth the
+// configured [OnUnauthorized] handler runs.
+func Require(resolver Resolver, opts ...Option) func(http.Handler) http.Handler {
+	c := newConfig(opts)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, ok, err := resolver(r)
+			if err != nil {
+				c.onError(w, r, err)
+				return
+			}
+			if !ok {
+				c.onUnauth(w, r)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
 	}
-	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+}
+
+// Optional returns middleware that attaches the resolved identity to
+// the request context when present, and passes unauthenticated
+// requests through unchanged. Resolver errors invoke [OnError].
+func Optional(resolver Resolver, opts ...Option) func(http.Handler) http.Handler {
+	c := newConfig(opts)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, ok, err := resolver(r)
+			if err != nil {
+				c.onError(w, r, err)
+				return
+			}
+			if ok {
+				r = r.WithContext(ctx)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // SessionResolver builds a [Resolver] that loads a session via cookie and

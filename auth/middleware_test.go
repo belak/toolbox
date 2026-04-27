@@ -24,10 +24,8 @@ func TestRequireAllowsAuthenticated(t *testing.T) {
 	ctx := context.Background()
 	s, _ := mgr.Create(ctx, 42, "password", struct{}{})
 
-	mw := &AuthMiddleware{Resolve: SessionResolver(mgr, sessionKey)}
-
 	var gotUserID int64
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(SessionResolver(mgr, sessionKey))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sess, _ := r.Context().Value(sessionKey).(*Session[struct{}])
 		gotUserID = sess.UserID
 		w.WriteHeader(http.StatusOK)
@@ -46,8 +44,7 @@ func TestRequireRejectsUnauthenticated(t *testing.T) {
 	store := newMemSessionStore()
 	mgr := NewSessionManager[struct{}](store)
 
-	mw := &AuthMiddleware{Resolve: SessionResolver(mgr, sessionKey)}
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(SessionResolver(mgr, sessionKey))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
@@ -62,13 +59,12 @@ func TestRequireCustomOnUnauth(t *testing.T) {
 	store := newMemSessionStore()
 	mgr := NewSessionManager[struct{}](store)
 
-	mw := &AuthMiddleware{
-		Resolve: SessionResolver(mgr, sessionKey),
-		OnUnauth: func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(
+		SessionResolver(mgr, sessionKey),
+		OnUnauthorized(func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
-		},
-	}
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		}),
+	)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
@@ -81,12 +77,10 @@ func TestRequireCustomOnUnauth(t *testing.T) {
 
 func TestRequireResolverError(t *testing.T) {
 	boom := errors.New("boom")
-	mw := &AuthMiddleware{
-		Resolve: func(r *http.Request) (context.Context, bool, error) {
-			return nil, false, boom
-		},
+	resolver := func(r *http.Request) (context.Context, bool, error) {
+		return nil, false, boom
 	}
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
@@ -100,16 +94,15 @@ func TestRequireResolverError(t *testing.T) {
 func TestRequireCustomOnError(t *testing.T) {
 	boom := errors.New("boom")
 	var gotErr error
-	mw := &AuthMiddleware{
-		Resolve: func(r *http.Request) (context.Context, bool, error) {
-			return nil, false, boom
-		},
-		OnError: func(w http.ResponseWriter, _ *http.Request, err error) {
+	resolver := func(r *http.Request) (context.Context, bool, error) {
+		return nil, false, boom
+	}
+	handler := Require(resolver,
+		OnError(func(w http.ResponseWriter, _ *http.Request, err error) {
 			gotErr = err
 			http.Error(w, "bad", http.StatusBadGateway)
-		},
-	}
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		}),
+	)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
@@ -125,10 +118,8 @@ func TestOptionalPassesThroughUnauthenticated(t *testing.T) {
 	store := newMemSessionStore()
 	mgr := NewSessionManager[struct{}](store)
 
-	mw := &AuthMiddleware{Resolve: SessionResolver(mgr, sessionKey)}
-
 	var sawSession bool
-	handler := mw.Optional(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Optional(SessionResolver(mgr, sessionKey))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, sawSession = r.Context().Value(sessionKey).(*Session[struct{}])
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -148,10 +139,8 @@ func TestOptionalAttachesWhenAuthenticated(t *testing.T) {
 	ctx := context.Background()
 	s, _ := mgr.Create(ctx, 7, "password", struct{}{})
 
-	mw := &AuthMiddleware{Resolve: SessionResolver(mgr, sessionKey)}
-
 	var gotUserID int64
-	handler := mw.Optional(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Optional(SessionResolver(mgr, sessionKey))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if sess, ok := r.Context().Value(sessionKey).(*Session[struct{}]); ok {
 			gotUserID = sess.UserID
 		}
@@ -177,15 +166,12 @@ func TestChainResolversFirstWins(t *testing.T) {
 	ctx := context.Background()
 	raw, _, _ := tokens.Create(ctx, 99, "ci", nil)
 
-	mw := &AuthMiddleware{
-		Resolve: ChainResolvers(
-			SessionResolver(sessions, sessionKey),
-			BearerTokenResolver(tokens, tokenKey),
-		),
-	}
-
+	resolver := ChainResolvers(
+		SessionResolver(sessions, sessionKey),
+		BearerTokenResolver(tokens, tokenKey),
+	)
 	var gotToken *APIToken
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotToken, _ = r.Context().Value(tokenKey).(*APIToken)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -205,13 +191,11 @@ func TestChainResolversAllUnauthenticated(t *testing.T) {
 	sessions := NewSessionManager[struct{}](store)
 	tokens := NewAPITokenManager(newMemTokenStore())
 
-	mw := &AuthMiddleware{
-		Resolve: ChainResolvers(
-			SessionResolver(sessions, sessionKey),
-			BearerTokenResolver(tokens, tokenKey),
-		),
-	}
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	resolver := ChainResolvers(
+		SessionResolver(sessions, sessionKey),
+		BearerTokenResolver(tokens, tokenKey),
+	)
+	handler := Require(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
@@ -236,9 +220,8 @@ func TestBasicAuthTokenResolverValid(t *testing.T) {
 		return 0, errors.New("not found")
 	}
 
-	mw := &AuthMiddleware{Resolve: BasicAuthTokenResolver(tokens, lookup, tokenKey)}
 	var gotToken *APIToken
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(BasicAuthTokenResolver(tokens, lookup, tokenKey))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotToken, _ = r.Context().Value(tokenKey).(*APIToken)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -260,8 +243,7 @@ func TestBasicAuthTokenResolverNoHeader(t *testing.T) {
 		return 0, nil
 	}
 
-	mw := &AuthMiddleware{Resolve: BasicAuthTokenResolver(tokens, lookup, tokenKey)}
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(BasicAuthTokenResolver(tokens, lookup, tokenKey))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
@@ -287,8 +269,7 @@ func TestBasicAuthTokenResolverWrongUsername(t *testing.T) {
 		return 0, errors.New("not found")
 	}
 
-	mw := &AuthMiddleware{Resolve: BasicAuthTokenResolver(tokens, lookup, tokenKey)}
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(BasicAuthTokenResolver(tokens, lookup, tokenKey))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
@@ -312,8 +293,7 @@ func TestBasicAuthTokenResolverLookupError(t *testing.T) {
 		return 0, boom
 	}
 
-	mw := &AuthMiddleware{Resolve: BasicAuthTokenResolver(tokens, lookup, tokenKey)}
-	handler := mw.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := Require(BasicAuthTokenResolver(tokens, lookup, tokenKey))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("should not reach handler")
 	}))
 
