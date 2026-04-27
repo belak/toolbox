@@ -80,7 +80,8 @@ func (m *AuthMiddleware) onError(w http.ResponseWriter, r *http.Request, err err
 
 // SessionResolver builds a [Resolver] that loads a session via cookie and
 // stores it in the request context under key. Callers retrieve it with a
-// typed helper of their own.
+// typed helper of their own. The resolver also stamps [KindSession] on
+// the context; see [GetKind] / [RequireKind].
 func SessionResolver[T any](sessions *SessionManager[T], key any) Resolver {
 	return func(r *http.Request) (context.Context, bool, error) {
 		s, err := sessions.GetFromRequest(r.Context(), r)
@@ -90,12 +91,15 @@ func SessionResolver[T any](sessions *SessionManager[T], key any) Resolver {
 		if s == nil {
 			return r.Context(), false, nil
 		}
-		return context.WithValue(r.Context(), key, s), true, nil
+		ctx := context.WithValue(r.Context(), key, s)
+		ctx = WithKind(ctx, KindSession)
+		return ctx, true, nil
 	}
 }
 
 // BearerTokenResolver builds a [Resolver] that validates an API token from
 // the Authorization header and stores it in the request context under key.
+// The resolver also stamps [KindBearer] on the context.
 func BearerTokenResolver(tokens *APITokenManager, key any) Resolver {
 	return func(r *http.Request) (context.Context, bool, error) {
 		raw := BearerToken(r)
@@ -109,7 +113,9 @@ func BearerTokenResolver(tokens *APITokenManager, key any) Resolver {
 		if t == nil {
 			return r.Context(), false, nil
 		}
-		return context.WithValue(r.Context(), key, t), true, nil
+		ctx := context.WithValue(r.Context(), key, t)
+		ctx = WithKind(ctx, KindBearer)
+		return ctx, true, nil
 	}
 }
 
@@ -157,7 +163,33 @@ func BasicAuthTokenResolver(tokens *APITokenManager, lookupUser func(ctx context
 		if t.UserID != userID {
 			return r.Context(), false, nil
 		}
-		return context.WithValue(r.Context(), key, t), true, nil
+		ctx := context.WithValue(r.Context(), key, t)
+		ctx = WithKind(ctx, KindBasic)
+		return ctx, true, nil
+	}
+}
+
+// RequirePredicate returns middleware that allows the request through
+// when check returns true; otherwise invokes onFail (defaults to 403
+// Forbidden). Use to gate post-auth requests on application-level
+// checks such as admin status, ownership, scopes, or feature flags.
+//
+// Compose after [AuthMiddleware.Require]: this middleware does not
+// itself require authentication.
+func RequirePredicate(check func(*http.Request) bool, onFail http.HandlerFunc) func(http.Handler) http.Handler {
+	if onFail == nil {
+		onFail = func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		}
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !check(r) {
+				onFail(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
 }
 

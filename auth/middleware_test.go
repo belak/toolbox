@@ -325,6 +325,164 @@ func TestBasicAuthTokenResolverLookupError(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
+func TestSessionResolverStampsKind(t *testing.T) {
+	store := newMemSessionStore()
+	mgr := NewSessionManager[struct{}](store, WithCookieName("sid"))
+	ctx := context.Background()
+	s, _ := mgr.Create(ctx, 1, "password", struct{}{})
+
+	resolver := SessionResolver(mgr, sessionKey)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: "sid", Value: s.ID})
+
+	gotCtx, ok, err := resolver(req)
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	k, present := GetKind(gotCtx)
+	assert.True(t, present)
+	assert.Equal(t, KindSession, k)
+}
+
+func TestBearerTokenResolverStampsKind(t *testing.T) {
+	tokens := NewAPITokenManager(newMemTokenStore())
+	raw, _, _ := tokens.Create(context.Background(), 1, "ci", nil)
+
+	resolver := BearerTokenResolver(tokens, tokenKey)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+raw)
+
+	gotCtx, ok, err := resolver(req)
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	k, present := GetKind(gotCtx)
+	assert.True(t, present)
+	assert.Equal(t, KindBearer, k)
+}
+
+func TestBasicAuthTokenResolverStampsKind(t *testing.T) {
+	tokens := NewAPITokenManager(newMemTokenStore())
+	raw, _, _ := tokens.Create(context.Background(), 42, "webdav", nil)
+	lookup := func(_ context.Context, _ string) (int64, error) { return 42, nil }
+
+	resolver := BasicAuthTokenResolver(tokens, lookup, tokenKey)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("alice", raw)
+
+	gotCtx, ok, err := resolver(req)
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	k, present := GetKind(gotCtx)
+	assert.True(t, present)
+	assert.Equal(t, KindBasic, k)
+}
+
+func TestRequireKindAllows(t *testing.T) {
+	mw := RequireKind(nil, KindSession)
+	called := false
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(WithKind(context.Background(), KindSession))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	assert.True(t, called)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestRequireKindRejectsMissing(t *testing.T) {
+	mw := RequireKind(nil, KindSession)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestRequireKindRejectsWrongKind(t *testing.T) {
+	mw := RequireKind(nil, KindSession)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(WithKind(context.Background(), KindBearer))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestRequireKindMultipleAllowed(t *testing.T) {
+	mw := RequireKind(nil, KindBearer, KindBasic)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for _, k := range []Kind{KindBearer, KindBasic} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(WithKind(context.Background(), k))
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, "kind %s should be allowed", k)
+	}
+}
+
+func TestRequireKindCustomOnFail(t *testing.T) {
+	mw := RequireKind(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "nope", http.StatusTeapot)
+	}, KindSession)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusTeapot, w.Code)
+}
+
+func TestRequirePredicateAllows(t *testing.T) {
+	mw := RequirePredicate(func(*http.Request) bool { return true }, nil)
+	called := false
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	assert.True(t, called)
+}
+
+func TestRequirePredicateRejectsDefault(t *testing.T) {
+	mw := RequirePredicate(func(*http.Request) bool { return false }, nil)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestRequirePredicateCustomOnFail(t *testing.T) {
+	mw := RequirePredicate(
+		func(*http.Request) bool { return false },
+		func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+		},
+	)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach handler")
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusSeeOther, w.Code)
+}
+
 func TestBearerToken(t *testing.T) {
 	cases := []struct {
 		header string

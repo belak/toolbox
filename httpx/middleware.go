@@ -110,6 +110,42 @@ func SecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// ByMethod returns middleware that dispatches to read for safe methods
+// (GET, HEAD, OPTIONS, plus any extraReadMethods such as "PROPFIND")
+// and write for everything else. Either middleware may be nil to skip
+// wrapping for that side.
+//
+// Use this to apply different gates to read vs. write paths on a single
+// route — e.g. requiring "files:read" scope for GET and "files:write"
+// for POST/PUT/DELETE.
+func ByMethod(read, write Middleware, extraReadMethods ...string) Middleware {
+	safe := map[string]struct{}{
+		http.MethodGet:     {},
+		http.MethodHead:    {},
+		http.MethodOptions: {},
+	}
+	for _, m := range extraReadMethods {
+		safe[m] = struct{}{}
+	}
+	return func(next http.Handler) http.Handler {
+		readChain := next
+		if read != nil {
+			readChain = read(next)
+		}
+		writeChain := next
+		if write != nil {
+			writeChain = write(next)
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := safe[r.Method]; ok {
+				readChain.ServeHTTP(w, r)
+				return
+			}
+			writeChain.ServeHTTP(w, r)
+		})
+	}
+}
+
 // CSP returns middleware that sets a Content-Security-Policy header on
 // every response. The policy is application-specific; callers pass it
 // in directly (e.g. "default-src 'self'; script-src 'self'").
